@@ -25,6 +25,10 @@ var QUICVersionContextKey = &quicVersionContextKey{}
 
 const clientSessionStateRevision = 5
 
+type ptlsDCIDConsumer interface {
+	SetDestinationConnectionID(dcid []byte)
+}
+
 type cryptoSetup struct {
 	tlsConf *tls.Config
 	conn    tlsQUICConn
@@ -81,6 +85,12 @@ func NewCryptoSetupClient(
 	logger utils.Logger,
 	version protocol.Version,
 ) (CryptoSetup, error) {
+	if tlsConf != nil && tlsConf.Rand != nil {
+		if consumer, ok := tlsConf.Rand.(ptlsDCIDConsumer); ok {
+			consumer.SetDestinationConnectionID(connID.Bytes())
+		}
+	}
+
 	cs := newCryptoSetup(
 		connID,
 		tp,

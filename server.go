@@ -50,8 +50,9 @@ type baseServer struct {
 	disableVersionNegotiation bool
 	acceptEarlyConns          bool
 
-	tlsConf *tls.Config
-	config  *Config
+	tlsConf     *tls.Config
+	config      *Config
+	ptlsRelayer *ptlsFallbackRelayer
 
 	conn rawConn
 
@@ -68,6 +69,12 @@ type baseServer struct {
 	zeroRTTQueues      map[protocol.ConnectionID]*zeroRTTQueue // only initialized if acceptEarlyConns == true
 
 	connContext func(context.Context, *ClientInfo) (context.Context, error)
+
+	retryingMx    sync.Mutex
+	retryingAddrs map[string]time.Time
+
+	ptlsRejectedMx    sync.Mutex
+	ptlsRejectedAddrs map[string]time.Time
 
 	// set as a member, so they can be set in the tests
 	newConn func(
@@ -118,6 +125,97 @@ type baseServer struct {
 	qlogger qlogwriter.Recorder
 
 	logger utils.Logger
+}
+
+func (s *baseServer) addRetryingAddr(addr net.Addr) {
+	if addr == nil {
+		return
+	}
+	s.retryingMx.Lock()
+	defer s.retryingMx.Unlock()
+	if s.retryingAddrs == nil {
+		s.retryingAddrs = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if len(s.retryingAddrs) > 256 {
+		for k, exp := range s.retryingAddrs {
+			if now.After(exp) {
+				delete(s.retryingAddrs, k)
+			}
+		}
+	}
+	s.retryingAddrs[addr.String()] = now.Add(5 * time.Second)
+}
+
+func (s *baseServer) isRetryingAddr(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	s.retryingMx.Lock()
+	defer s.retryingMx.Unlock()
+	if s.retryingAddrs == nil {
+		return false
+	}
+	exp, ok := s.retryingAddrs[addr.String()]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(s.retryingAddrs, addr.String())
+		return false
+	}
+	return true
+}
+
+func (s *baseServer) removeRetryingAddr(addr net.Addr) {
+	if addr == nil {
+		return
+	}
+	s.retryingMx.Lock()
+	if s.retryingAddrs != nil {
+		delete(s.retryingAddrs, addr.String())
+	}
+	s.retryingMx.Unlock()
+}
+
+// markPTLSRejected remembers a remote address whose Initial was rejected without fallback
+// (e.g. unknown SNI), so the remaining Initial packets of the same ClientHello are dropped too
+// instead of being relayed to the fallback target.
+func (s *baseServer) markPTLSRejected(addr net.Addr) {
+	if addr == nil {
+		return
+	}
+	s.ptlsRejectedMx.Lock()
+	defer s.ptlsRejectedMx.Unlock()
+	if s.ptlsRejectedAddrs == nil {
+		s.ptlsRejectedAddrs = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if len(s.ptlsRejectedAddrs) > 256 {
+		for k, exp := range s.ptlsRejectedAddrs {
+			if now.After(exp) {
+				delete(s.ptlsRejectedAddrs, k)
+			}
+		}
+	}
+	s.ptlsRejectedAddrs[addr.String()] = now.Add(5 * time.Second)
+}
+
+func (s *baseServer) isPTLSRejected(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	s.ptlsRejectedMx.Lock()
+	defer s.ptlsRejectedMx.Unlock()
+	exp, ok := s.ptlsRejectedAddrs[addr.String()]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(s.ptlsRejectedAddrs, addr.String())
+		return false
+	}
+	return true
 }
 
 // A Listener listens for incoming QUIC connections.
@@ -263,6 +361,7 @@ func newServer(
 		verifySourceAddress:       verifySourceAddress,
 		connIDGenerator:           connIDGenerator,
 		statelessResetter:         statelessResetter,
+		retryingAddrs:             make(map[string]time.Time),
 		connQueue:                 make(chan *Conn, protocol.MaxAcceptQueueSize),
 		errorChan:                 make(chan struct{}),
 		stopAccepting:             make(chan struct{}),
@@ -281,6 +380,14 @@ func newServer(
 	}
 	if acceptEarly {
 		s.zeroRTTQueues = map[protocol.ConnectionID]*zeroRTTQueue{}
+	}
+	if tlsConf != nil && tlsConf.Rand != nil {
+		if gk, ok := tlsConf.Rand.(PTLSInitialGatekeeper); ok {
+			fbCfg := gk.GetFallbackConfig()
+			if fbCfg.Enabled {
+				s.ptlsRelayer = newPTLSFallbackRelayer(conn, fbCfg, s.logger)
+			}
+		}
 	}
 	go s.run()
 	go s.runSendQueue()
@@ -372,6 +479,9 @@ func (s *baseServer) close(e error, transportClose bool) {
 	// wait until all handshakes in flight have terminated
 	s.handshakingCount.Wait()
 	close(s.stopAccepting)
+	if s.ptlsRelayer != nil {
+		s.ptlsRelayer.Close()
+	}
 
 	if transportClose {
 		// if the transport is closing, drain the connQueue. All connections in the queue
@@ -408,6 +518,15 @@ func (s *baseServer) handlePacket(p receivedPacket) {
 }
 
 func (s *baseServer) handlePacketImpl(p receivedPacket) bool /* is the buffer still in use? */ {
+	if s.ptlsRelayer != nil && s.ptlsRelayer.HasSession(p.remoteAddr) {
+		if s.isRetryingAddr(p.remoteAddr) {
+			s.logger.Debugf("Remote %s is in Retry handshake, bypassing Fallback relay", p.remoteAddr)
+		} else {
+			s.ptlsRelayer.HandlePacket(p.data, p.remoteAddr, p.info)
+			return false
+		}
+	}
+
 	if !s.nextZeroRTTCleanup.IsZero() && p.rcvTime.After(s.nextZeroRTTCleanup) {
 		defer s.cleanupZeroRTTQueues(p.rcvTime)
 	}
@@ -717,6 +836,7 @@ func (s *baseServer) handleInitialImpl(p receivedPacket, hdr *wire.Header) error
 			token = tok
 		}
 	}
+
 	if token != nil {
 		clientAddrVerified = s.validateToken(token, p.remoteAddr)
 		if !clientAddrVerified {
@@ -740,8 +860,54 @@ func (s *baseServer) handleInitialImpl(p receivedPacket, hdr *wire.Header) error
 		}
 	}
 
+	if s.tlsConf != nil && s.tlsConf.Rand != nil {
+		if gatekeeper, ok := s.tlsConf.Rand.(PTLSInitialGatekeeper); ok {
+			var (
+				passed        bool
+				allowFallback bool
+				ptlsErr       error
+			)
+			if token != nil && token.IsRetryToken && clientAddrVerified {
+				passed = true
+			} else if s.isPTLSRejected(p.remoteAddr) {
+				passed, allowFallback, ptlsErr = false, false, errors.New("ptls: remote address recently rejected")
+			} else {
+				passed, allowFallback, ptlsErr = s.checkPTLS(p, hdr, origDestConnID, gatekeeper)
+			}
+			if !passed {
+				isRetrying := s.isRetryingAddr(p.remoteAddr)
+				if q, ok := s.zeroRTTQueues[hdr.DestConnectionID]; ok {
+					for _, qp := range q.packets {
+						qp.buffer.Release()
+					}
+					delete(s.zeroRTTQueues, hdr.DestConnectionID)
+				}
+				if origDestConnID != hdr.DestConnectionID {
+					if q, ok := s.zeroRTTQueues[origDestConnID]; ok {
+						for _, qp := range q.packets {
+							qp.buffer.Release()
+						}
+						delete(s.zeroRTTQueues, origDestConnID)
+					}
+				}
+				if !allowFallback {
+					s.markPTLSRejected(p.remoteAddr)
+				}
+				if allowFallback && s.ptlsRelayer != nil && !isRetrying {
+					s.ptlsRelayer.HandlePacket(p.data, p.remoteAddr, p.info)
+				}
+				p.buffer.Release()
+				if ptlsErr != nil && s.logger.Debug() {
+					s.logger.Debugf("PTLS verification rejected: %s", ptlsErr)
+				}
+				return nil
+			}
+		}
+	}
+
 	if token == nil && s.verifySourceAddress != nil && s.verifySourceAddress(p.remoteAddr) {
 		// Retry invalidates all 0-RTT packets sent.
+		s.addRetryingAddr(p.remoteAddr)
 		delete(s.zeroRTTQueues, hdr.DestConnectionID)
 		select {
 		case s.retryQueue <- rejectedPacket{receivedPacket: p, hdr: hdr}:
@@ -854,6 +1020,7 @@ func (s *baseServer) handleInitialImpl(p receivedPacket, hdr *wire.Header) error
 		delete(s.zeroRTTQueues, hdr.DestConnectionID)
 	}
 
+	s.removeRetryingAddr(p.remoteAddr)
 	s.handshakingCount.Go(func() { s.handleNewConn(conn) })
 	go conn.run()
 	return nil
@@ -1117,4 +1284,47 @@ func (s *baseServer) maybeSendVersionNegotiationPacket(p receivedPacket) {
 	if _, err := s.conn.WritePacket(data, p.remoteAddr, p.info.OOB(), 0, protocol.ECNUnsupported); err != nil {
 		s.logger.Debugf("Error sending Version Negotiation: %s", err)
 	}
+}
+
+func (s *baseServer) checkPTLS(p receivedPacket, hdr *wire.Header, origDestConnID protocol.ConnectionID, gatekeeper PTLSInitialGatekeeper) (passed bool, allowFallback bool, err error) {
+	packetLen := int(hdr.ParsedLen() + hdr.Length)
+	if len(p.data) < packetLen {
+		return false, true, errors.New("ptls: packet length smaller than header length")
+	}
+	dataCopy := make([]byte, packetLen)
+	copy(dataCopy, p.data[:packetLen])
+
+	_, opener := handshake.NewInitialAEAD(origDestConnID, protocol.PerspectiveServer, hdr.Version)
+	extHdr, err := unpackLongHeader(opener, hdr, dataCopy)
+	if err != nil {
+		vPassed, vErr := gatekeeper.VerifyInitial(origDestConnID.Bytes(), nil, p.data, p.remoteAddr)
+		return vPassed, !vPassed, vErr
+	}
+	hdrLen := extHdr.ParsedLen()
+	if int(hdrLen) > len(dataCopy) {
+		vPassed, vErr := gatekeeper.VerifyInitial(origDestConnID.Bytes(), nil, p.data, p.remoteAddr)
+		return vPassed, !vPassed, vErr
+	}
+	decrypted, err := opener.Open(dataCopy[hdrLen:hdrLen], dataCopy[hdrLen:], extHdr.PacketNumber, dataCopy[:hdrLen])
+	if err != nil {
+		vPassed, vErr := gatekeeper.VerifyInitial(origDestConnID.Bytes(), nil, p.data, p.remoteAddr)
+		return vPassed, !vPassed, vErr
+	}
+
+	random, err := ParseClientHelloRandom(decrypted)
+	if err == nil {
+		if checker, ok := gatekeeper.(PTLSSNIChecker); ok {
+			serverName := ParseClientHelloSNI(decrypted)
+			if !checker.CheckSNI(serverName) {
+				return false, false, fmt.Errorf("ptls: rejected unknown server name %q", serverName)
+			}
+		}
+	}
+	if err != nil {
+		vPassed, vErr := gatekeeper.VerifyInitial(origDestConnID.Bytes(), nil, p.data, p.remoteAddr)
+		return vPassed, !vPassed, vErr
+	}
+
+	vPassed, vErr := gatekeeper.VerifyInitial(origDestConnID.Bytes(), random, p.data, p.remoteAddr)
+	return vPassed, !vPassed, vErr
 }
